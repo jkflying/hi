@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Call</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#111;--fg:#eee;--panel:#222;--accent:#3b82f6;--bad:#dc2626;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg);height:100dvh;display:flex;flex-direction:column}
+button,input{font:inherit;color:inherit;background:var(--panel);border:1px solid #444;border-radius:8px;padding:10px 14px}
+button{cursor:pointer}
+button.off{background:var(--bad);border-color:var(--bad)}
+.primary{background:var(--accent);border-color:var(--accent)}
+#lobby{margin:auto;display:flex;flex-direction:column;gap:12px;width:min(320px,100% - 32px)}
+#lobby h1{margin:0 0 8px;font-weight:500}
+#call{flex:1;display:flex;flex-direction:column;min-height:0}
+[hidden]{display:none!important}
+#stage{flex:1;display:flex;min-height:0}
+#grid{flex:1;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:8px;padding:8px;overflow:auto;align-content:center}
+.tile{position:relative;background:var(--panel);border-radius:12px;overflow:hidden;aspect-ratio:16/9}
+.tile video{width:100%;height:100%;object-fit:cover;display:block}
+.tile.novid video{visibility:hidden}
+.tile span{position:absolute;left:8px;bottom:8px;background:#0008;padding:2px 8px;border-radius:6px;font-size:14px}
+.tile.novid span{left:50%;bottom:50%;transform:translate(-50%,50%);font-size:20px;background:none}
+#chat{width:min(320px,100%);display:flex;flex-direction:column;background:var(--panel);border-left:1px solid #333}
+#log{flex:1;overflow:auto;padding:8px;font-size:14px;overflow-wrap:anywhere}
+#log b{color:var(--accent)}
+#say{display:flex;gap:4px;padding:8px}
+#say input{flex:1;min-width:0}
+nav{display:flex;gap:8px;justify-content:center;padding:8px;flex-wrap:wrap}
+#toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--panel);padding:8px 16px;border-radius:8px}
+@media (max-width:640px){#chat{position:fixed;inset:0 0 64px 0;width:auto;border:0}}
+</style>
+</head>
+<body>
+<form id="lobby">
+  <h1>Call</h1>
+  <input id="code" inputmode="numeric" autocomplete="off" placeholder="Code (6–12 digits)" aria-label="Call code">
+  <input id="name" maxlength="30" placeholder="Your name" aria-label="Your name">
+  <label><input type="checkbox" id="voice"> Voice only</label>
+  <button class="primary">Join</button>
+  <button type="button" id="new">New call</button>
+</form>
+<main id="call" hidden>
+  <div id="stage">
+    <div id="grid"></div>
+    <aside id="chat" hidden>
+      <div id="log" aria-live="polite"></div>
+      <form id="say"><input id="msg" autocomplete="off" maxlength="2000" aria-label="Message"><button>Send</button></form>
+    </aside>
+  </div>
+  <nav>
+    <button id="mic">Mic</button>
+    <button id="cam">Cam</button>
+    <button id="chatBtn">Chat</button>
+    <button id="share">Share</button>
+    <button id="leave" class="off">Leave</button>
+  </nav>
+</main>
+<div id="toast" hidden></div>
+<script>
+const $ = id => document.getElementById(id)
+const hex = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('')
+const ICE = [{urls: 'stun:' + location.hostname + ':{{STUN_PORT}}'}]
+const BIG = 6 // above this many people, only people who are talking send video
+const me = {id: hex(8), token: hex(16)}
+const peers = {} // id -> {id, pc, dc, d, s, name, ok, relay, chain}
+const chats = [], seen = new Set() // recent chat, replayed to late joiners; ids dedupe replays from several peers
+let room, local, ac, mine, micOn = true, camOn = false, sentVideo = null, talking = false
+
+const toast = (t, ms = 2500) => { $('toast').textContent = t; $('toast').hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => $('toast').hidden = true, ms) }
+try { $('name').value = localStorage.name || '' } catch {}
+
+const fromUrl = location.pathname.slice(1)
+if (/^\d{6,12}$/.test(fromUrl)) { $('code').value = fromUrl; $('code').hidden = $('new').hidden = true }
+onpopstate = () => location.reload()
+
+// 10 digits so generated rooms can't be found by scanning; typed codes can still be as short as 6
+$('new').onclick = () => { $('code').value = String(10n ** 9n + crypto.getRandomValues(new BigUint64Array(1))[0] % (9n * 10n ** 9n)); $('lobby').requestSubmit() }
+
+$('lobby').onsubmit = async e => {
+  e.preventDefault()
+  if ($('lobby').inert) return // already joining or joined
+  room = $('code').value.trim()
+  if (!/^\d{6,12}$/.test(room)) return toast('Code must be 6–12 digits')
+  try { localStorage.name = $('name').value } catch {}
+  $('lobby').inert = true
+  ac = new AudioContext() // created inside the click so it isn't suspended
+  try { local = await navigator.mediaDevices.getUserMedia({audio: true, video: !$('voice').checked}) }
+  catch { try { local = await navigator.mediaDevices.getUserMedia({audio: true}) } catch { $('lobby').inert = false; return toast('Microphone access is needed') } }
+  camOn = local.getVideoTracks().length > 0
+  history.pushState(0, '', '/' + room)
+  $('lobby').hidden = true; $('call').hidden = false
+  $('cam').classList.toggle('off', !camOn)
+  mine = tile(me.id, 'You', local, true)
+  mine.d.classList.toggle('novid', !camOn)
+  const es = new EventSource(`/api/${room}/events?id=${me.id}&token=${me.token}`)
+  es.onmessage = e => {
+    const m = JSON.parse(e.data)
+    // newcomer always offers, so there's never offer glare; on SSE reconnect skip peers we already have
+    if (m.t == 'hello') m.peers.forEach(id => peers[id] || connect(id, true))
+    if (m.t == 'signal') onSignal(m.from, m.data)
+    if (m.t == 'leave' && peers[m.id] && !peers[m.id].ok) drop(m.id) // P2P peers detect leaving themselves
+  }
+  es.onerror = () => es.readyState == EventSource.CLOSED && toast('Lost the server, reload to let new people join', 1e9)
+  watchVoice()
+}
+
+let sendQ = Promise.resolve() // keep signaling in order: an ICE candidate must never overtake its SDP
+const sig = (to, data) => sendQ = sendQ.then(async () => {
+  const body = JSON.stringify({token: me.token, to, data})
+  for (let i = 0; i < 5; i++) { // retries cover our own event stream reconnecting (403)
+    const r = await fetch('/api/signal', {method: 'POST', body}).catch(() => null)
+    if (r?.ok) return
+    if (r?.status == 404) return peers[to]?.ok || drop(to) // they've left the server
+    await new Promise(f => setTimeout(f, 1000))
+  }
+})
+
+function tile(id, label, stream, mine) {
+  const d = document.createElement('div'), v = document.createElement('video'), s = document.createElement('span')
+  d.className = 'tile'; v.autoplay = v.playsInline = true; v.muted = !!mine; v.srcObject = stream; s.textContent = label
+  d.append(v, s); $('grid').append(d)
+  return {d, s}
+}
+
+function connect(id, offer) {
+  const pc = new RTCPeerConnection({iceServers: ICE}), ms = new MediaStream()
+  const p = peers[id] = {id, pc, name: '…', chain: Promise.resolve(), ...tile(id, '…', ms)}
+  p.d.classList.add('novid')
+  p.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
+  p.dc.onopen = () => { toPeer(p, {t: 'v', on: !!sentVideo}); greet(p) }
+  p.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
+  p.dc.onclose = () => p.relay || drop(id)
+  pc.ontrack = e => ms.addTrack(e.track)
+  pc.onicecandidate = e => e.candidate && sig(id, {c: e.candidate})
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState == 'connected') p.ok = true
+    if (pc.connectionState != 'failed' || peers[id] != p) return
+    if (!p.ok) return relay(p)
+    // worked before, so the network changed: start over. The lower id offers, so only one side does.
+    drop(id)
+    if (me.id < id) connect(id, true)
+  }
+  setTimeout(() => peers[id] == p && !p.ok && relay(p), 40000) // a lost offer/answer never reaches 'failed'
+  if (offer) {
+    pc.addTransceiver('audio', {direction: 'sendrecv'})
+    pc.addTransceiver('video', {direction: 'sendrecv'})
+    setTracks(p)
+    pc.setLocalDescription().then(() => sig(id, {sdp: pc.localDescription}))
+  }
+  update()
+  return p
+}
+
+function setTracks(p) {
+  const [a, v] = p.pc.getTransceivers()
+  a.sender.replaceTrack(local.getAudioTracks()[0] || null)
+  v.sender.replaceTrack(sentVideo)
+}
+
+// hole punching failed: keep the peer for chat, relayed through the server's signal channel
+function relay(p) {
+  if (p.relay || p.ok) return
+  p.relay = true; p.pc.close(); label(p); greet(p)
+}
+
+function onSignal(from, d) {
+  let p = peers[from]
+  if (d.m) return p && onData(p, d.m) // relayed chat
+  if (d.sdp?.type == 'offer' && p) { drop(from); p = null } // they're reconnecting after a network change
+  if (!p) { if (d.sdp?.type != 'offer') return; p = connect(from, false) }
+  p.chain = p.chain.then(async () => {
+    if (d.sdp) {
+      await p.pc.setRemoteDescription(d.sdp)
+      if (d.sdp.type == 'offer') {
+        p.pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
+        setTracks(p)
+        await p.pc.setLocalDescription()
+        sig(from, {sdp: p.pc.localDescription})
+      }
+    } else if (d.c) {
+      await p.pc.addIceCandidate(d.c)
+      predict(p.pc, d.c)
+    }
+  }).catch(console.warn)
+}
+
+// ponytail: port prediction for NATs that hand out ports sequentially (some CGNATs).
+// Useless against random-port NATs; those need TURN.
+function predict(pc, c) {
+  const f = c.candidate.split(' ')
+  if (f[7] != 'srflx' || f[2].toLowerCase() != 'udp') return
+  for (let k = 1; k <= 8; k++) {
+    const port = +f[5] + k
+    if (port > 65535) break
+    pc.addIceCandidate({candidate: `candidate:p${k} 1 udp ${+f[3] - k} ${f[4]} ${port} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex}).catch(() => {})
+  }
+}
+
+function drop(id) {
+  const p = peers[id]
+  if (!p) return
+  delete peers[id]
+  p.pc.close(); p.d.remove()
+  update()
+}
+
+function onData(p, m) {
+  if (m.t == 'name') { p.name = String(m.name).slice(0, 30); label(p) }
+  if (m.t == 'v') p.d.classList.toggle('novid', !m.on)
+  if ((m.t == 'chat' || m.t == 'hist') && typeof m.id == 'string' && !seen.has(m.id)) {
+    // live messages are named after the peer that sent them; replayed history has to trust the replayer
+    const name = m.t == 'chat' ? p.name : String(m.name).slice(0, 30)
+    remember({t: 'chat', id: m.id, name, text: String(m.text).slice(0, 2000), ts: m.ts}); log(name, m.text)
+  }
+}
+
+const label = p => p.s.textContent = p.name + (p.relay ? ' · chat only' : '')
+const toPeer = (p, m) => p.dc.readyState == 'open' ? p.dc.send(JSON.stringify(m)) : p.relay && sig(p.id, {m})
+const bcast = m => Object.values(peers).forEach(p => toPeer(p, m))
+const greet = p => { toPeer(p, {t: 'name', name: myName()}); chats.forEach(m => toPeer(p, {...m, t: 'hist'})) }
+const myName = () => $('name').value.trim() || 'Guest'
+const remember = m => { seen.add(m.id); chats.push(m); if (chats.length > 50) chats.shift() }
+
+function log(who, text) {
+  const div = document.createElement('div'), b = document.createElement('b')
+  b.textContent = who + ': '; div.append(b, String(text).slice(0, 2000))
+  $('log').append(div); $('log').scrollTop = 1e9
+  if ($('chat').hidden && who != 'You') toast(who + ': ' + text)
+}
+
+// Decide whether we send video: always in small rooms, only while talking in big ones.
+function update() {
+  const big = Object.keys(peers).length + 1 > BIG
+  const want = camOn && (!big || talking) ? local.getVideoTracks()[0] : null
+  if (want == sentVideo) return
+  sentVideo = want
+  Object.values(peers).forEach(p => p.relay || p.pc.getTransceivers()[1]?.sender.replaceTrack(want))
+  bcast({t: 'v', on: !!want})
+}
+
+// ponytail: each client decides alone, no global cap on simultaneous video senders;
+// add "max N senders, newest speaker wins" if crosstalk saturates links.
+function watchVoice() {
+  const an = ac.createAnalyser(), buf = new Float32Array(an.fftSize), hist = []
+  ac.createMediaStreamSource(local).connect(an)
+  let lastLoud = 0
+  setInterval(() => {
+    an.getFloatTimeDomainData(buf)
+    const rms = Math.sqrt(buf.reduce((s, x) => s + x * x, 0) / buf.length)
+    const loud = micOn && rms > 0.02 // tune if mics are very quiet/noisy
+    hist.push(loud); if (hist.length > 20) hist.shift() // 2s window
+    if (loud) lastLoud = Date.now()
+    if (hist.filter(Boolean).length > 10) talking = true
+    else if (Date.now() - lastLoud > 5000) talking = false
+    update()
+  }, 100)
+}
+
+$('mic').onclick = () => {
+  micOn = !micOn
+  local.getAudioTracks().forEach(t => t.enabled = micOn)
+  $('mic').classList.toggle('off', !micOn)
+}
+
+$('cam').onclick = async () => {
+  if ($('cam').disabled) return
+  $('cam').disabled = true
+  try { await toggleCam() } finally { $('cam').disabled = false }
+}
+
+async function toggleCam() {
+  if (camOn) { // stop the track so the camera light goes off
+    local.getVideoTracks().forEach(t => { t.stop(); local.removeTrack(t) })
+  } else {
+    try { local.addTrack((await navigator.mediaDevices.getUserMedia({video: true})).getVideoTracks()[0]) }
+    catch { return toast('Camera unavailable') }
+  }
+  camOn = !camOn
+  $('cam').classList.toggle('off', !camOn)
+  mine.d.classList.toggle('novid', !camOn)
+  update()
+}
+
+$('chatBtn').onclick = () => { $('chat').hidden = !$('chat').hidden; $('chat').hidden || $('msg').focus() }
+$('say').onsubmit = e => {
+  e.preventDefault()
+  const text = $('msg').value.trim()
+  if (!text) return
+  const m = {t: 'chat', id: hex(8), name: myName(), text, ts: Date.now()}
+  remember(m); bcast(m); log('You', text); $('msg').value = ''
+}
+
+$('share').onclick = async () => {
+  if (navigator.share) try { return await navigator.share({title: 'Join my call', url: location.href}) } catch (e) { if (e.name == 'AbortError') return }
+  try { await navigator.clipboard.writeText(location.href); toast('Link copied') } catch { toast(location.href, 6000) }
+}
+
+$('leave').onclick = () => location.href = '/'
+</script>
+</body>
+</html>
