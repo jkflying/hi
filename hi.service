@@ -1,0 +1,19 @@
+[Unit]
+Description=hi: P2P call signaling + STUN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Plain HTTP on localhost: put a TLS-terminating proxy in front (browsers need HTTPS for camera/mic).
+# STUN on UDP 3478 must be reachable from the internet.
+ExecStart=/usr/local/bin/hi -addr 127.0.0.1:8090 -stun :3478
+Restart=always
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
