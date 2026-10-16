@@ -154,7 +154,7 @@ function mkpc(p, cert) {
   pc.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
   pc.dc.onopen = () => { adopt(p, pc); p.pc == pc && (toPeer(p, {t: 'v', on: !!sentVideo}), greet(p)) }
   pc.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
-  pc.dc.onclose = () => p.pc == pc && !p.relay && drop(p.id)
+  pc.dc.onclose = () => p.pc == pc && p.ok && !p.relay && drop(p.id) // Firefox closes it when ICE fails, before any connection
   pc.ontrack = e => pc.ms.addTrack(e.track)
   pc.onconnectionstatechange = () => {
     if (pc.connectionState == 'connected') adopt(p, pc)
@@ -214,10 +214,11 @@ function stages(p) {
 
 const status = (p, t) => p.i.textContent = t ? t + (p.ok || p.relay ? '' : '…') : ''
 
-// add made-up remote candidates: the peer's NAT IP at ports we hope it will use
+// add made-up remote candidates: the peer's NAT IP at ports we hope it will use. Trickled at about
+// Chrome's check rate: Firefox checks a batch fast, declares ICE failed and stops, but new candidates restart it.
 function spray(pc, ip, ports) {
-  ports.forEach((port, k) => port > 0 && port < 65536 &&
-    pc.addIceCandidate({candidate: `candidate:g${k} 1 udp ${1e6 - k} ${ip} ${port} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: '0'}).catch(() => {}))
+  ports.forEach((port, k) => port > 0 && port < 65536 && setTimeout(() => pc.signalingState != 'closed' &&
+    pc.addIceCandidate({candidate: `candidate:g${k} 1 udp ${1e6 - k} ${ip} ${port} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: '0'}).catch(() => {}), k * GAP))
 }
 
 // Stage 2: NATs that hand out ports in order (often per subscriber) put our mapping just above
@@ -232,10 +233,15 @@ function guess(p) {
 // Stage 3, birthday punch: the hard side opens K connections, each making a NAT mapping toward each of our
 // H sockets, and each socket probes M random ports on its IP: P(hit) ≈ 1-e^(-H*K*M/range). Half the probes
 // go near the ports the STUN servers saw (CGNATs often give each subscriber a block of ports), half
-// anywhere: ~80% for a fully random NAT, near certain inside a block of a few thousand ports. Each side's
-// attempts share ICE credentials and a DTLS certificate, so any pair that meets can finish the handshake.
-// ponytail: Chrome checks ~16 candidates/s per connection, so M=256 takes ~30s; H is the knob for speed.
-const H = 8, K = 48, M = 256
+// anywhere. Each side's attempts share ICE credentials and a DTLS certificate, so any pair that meets can finish the handshake.
+// Measured on Salt 5G: the K mappings toward one of our sockets come out as a near-contiguous run on a
+// per-destination counter that sits anywhere in 1024-65535, so each probe hits with P ≈ K/64512 and the
+// STUN-seen ports say nothing about where. Hits ≈ our probes * K/64512, probes filling the 12s-60s window.
+// Chrome checks ~16/s per connection: ~12 expected hits. Firefox caps STUN at ~78/s per page, which also
+// limits how many of the H*K mappings it makes as the hard side: ~4 hits with one Firefox, ~1.5 with
+// two. The H*K mappings cost the hard side's carrier NAT; it took ~1000 fine.
+// ponytail: K stays modest because each connection costs the phone memory.
+const H = 16, K = 64, GAP = 60, M = 800
 
 async function shared() {
   const cert = await RTCPeerConnection.generateCertificate({name: 'ECDSA', namedCurve: 'P-256'}), u = hex(8), w = hex(16)
@@ -279,6 +285,11 @@ async function onBurst(p, d) {
     p.bc.forEach(c => pc.addIceCandidate(c).catch(() => {}))
   }
   sig(p.id, {sdp: p.bs[0].localDescription, b: 1})
+  // Firefox checks each pair once or twice, then gives up: re-add the candidates under new names so it
+  // keeps the mappings toward us alive and still answers when a probe finally lands. Not more often: under
+  // Firefox's STUN rate cap (~63/s per page) one round of K*H checks takes ~16s.
+  const again = setInterval(() => p.ok || p.relay || !p.bs.length ? clearInterval(again) : p.bs.forEach(pc =>
+    p.bc.forEach(c => pc.addIceCandidate({...c, candidate: c.candidate.replace(/^candidate:\S+/, 'candidate:r' + hex(4))}).catch(() => {}))), 20000)
 }
 
 function onSignal(from, d) {

@@ -86,7 +86,7 @@ function summary(r, server) {
   L.push(`IPv4 mapping: ${ports.size <= 1 ? 'same port for every destination (easy NAT)' : ports.size + ' different ports for 7 destinations (hard NAT)'}`, '')
 
   // the server's view, in arrival order, without retransmits
-  const seen = new Set(), seq = server.filter(h => h.ip.includes('.') && !seen.has(h.port) && seen.add(h.port))
+  const seen = new Set(), seq = server.filter(h => h.ip.includes('.') && h.t >= r.start - 2000 && !seen.has(h.port) && seen.add(h.port))
   if (seq.length > 1) {
     const d = seq.slice(1).map((h, i) => h.port - seq[i].port), sorted = [...d].sort((a, b) => a - b)
     const small = d.filter(x => x > 0 && x <= 8).length
