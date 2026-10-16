@@ -24,6 +24,8 @@ button.off{background:var(--bad);border-color:var(--bad)}
 .tile.novid video{visibility:hidden}
 .tile span{position:absolute;left:8px;bottom:8px;background:#0008;padding:2px 8px;border-radius:6px;font-size:14px}
 .tile.novid span{left:50%;bottom:50%;transform:translate(-50%,50%);font-size:20px;background:none}
+.tile i{position:absolute;right:8px;top:8px;background:#0008;padding:2px 8px;border-radius:6px;font:12px system-ui,sans-serif}
+.tile i:empty{display:none}
 #chat{width:min(320px,100%);display:flex;flex-direction:column;background:var(--panel);border-left:1px solid #333}
 #log{flex:1;overflow:auto;padding:8px;font-size:14px;overflow-wrap:anywhere}
 #log b{color:var(--accent)}
@@ -63,10 +65,13 @@ nav{display:flex;gap:8px;justify-content:center;padding:8px;flex-wrap:wrap}
 <script>
 const $ = id => document.getElementById(id)
 const hex = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('')
-const ICE = [{urls: 'stun:' + location.hostname + ':{{STUN_PORT}}'}]
+// four STUN ports: a NAT that maps them to different ports picks a new port per destination ("hard" NAT),
+// and the ports it picks hint at its step and range
+const ICE = [{urls: [0, 1, 2, 3].map(k => `stun:${location.hostname}:${+'{{STUN_PORT}}' + k}`)}]
+const CFG = {iceServers: ICE, bundlePolicy: 'max-bundle'} // one socket per network, so a second port means a hard NAT
 const BIG = 6 // above this many people, only people who are talking send video
 const me = {id: hex(8), token: hex(16)}
-const peers = {} // id -> {id, pc, dc, d, s, name, ok, relay, chain}
+const peers = {} // id -> {id, pc, d, v, s, i, name, ok, relay, chain, ls, rs, bs, bc}
 const chats = [], seen = new Set() // recent chat, replayed to late joiners; ids dedupe replays from several peers
 let room, local, ac, mine, micOn = true, camOn = false, sentVideo = null, talking = false
 
@@ -120,43 +125,64 @@ const sig = (to, data) => sendQ = sendQ.then(async () => {
 })
 
 function tile(id, label, stream, mine) {
-  const d = document.createElement('div'), v = document.createElement('video'), s = document.createElement('span')
+  const d = document.createElement('div'), v = document.createElement('video'), s = document.createElement('span'), i = document.createElement('i')
   d.className = 'tile'; v.autoplay = v.playsInline = true; v.muted = !!mine; v.srcObject = stream; s.textContent = label
-  d.append(v, s); $('grid').append(d)
-  return {d, s}
+  d.append(v, s, i); $('grid').append(d)
+  return {d, v, s, i}
 }
 
 function connect(id, offer) {
-  const pc = new RTCPeerConnection({iceServers: ICE}), ms = new MediaStream()
-  const p = peers[id] = {id, pc, name: '…', chain: Promise.resolve(), ...tile(id, '…', ms)}
+  const p = peers[id] = {id, name: '…', chain: Promise.resolve(), ls: [], rs: [], bs: [], bc: [], ...tile(id, '…', null)}
+  const pc = p.pc = mkpc(p)
+  p.v.srcObject = pc.ms
   p.d.classList.add('novid')
-  p.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
-  p.dc.onopen = () => { toPeer(p, {t: 'v', on: !!sentVideo}); greet(p) }
-  p.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
-  p.dc.onclose = () => p.relay || drop(id)
-  pc.ontrack = e => ms.addTrack(e.track)
-  pc.onicecandidate = e => e.candidate && sig(id, {c: e.candidate})
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState == 'connected') p.ok = true
-    if (pc.connectionState != 'failed' || peers[id] != p) return
-    if (!p.ok) return relay(p)
-    // worked before, so the network changed: start over. The lower id offers, so only one side does.
-    drop(id)
-    if (me.id < id) connect(id, true)
-  }
-  setTimeout(() => peers[id] == p && !p.ok && relay(p), 40000) // a lost offer/answer never reaches 'failed'
+  pc.onicecandidate = e => { if (e.candidate) { sig(id, {c: e.candidate}); srflx(e.candidate) && p.ls.push(srflx(e.candidate)) } }
   if (offer) {
-    pc.addTransceiver('audio', {direction: 'sendrecv'})
-    pc.addTransceiver('video', {direction: 'sendrecv'})
-    setTracks(p)
+    av(pc)
     pc.setLocalDescription().then(() => sig(id, {sdp: pc.localDescription}))
   }
+  status(p, 'connecting')
+  stages(p)
   update()
   return p
 }
 
-function setTracks(p) {
-  const [a, v] = p.pc.getTransceivers()
+// One connection attempt to peer p. Several can race (see burst); the first to connect is adopted.
+function mkpc(p, cert) {
+  const pc = new RTCPeerConnection({...CFG, certificates: cert && [cert]})
+  pc.ms = new MediaStream()
+  pc.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
+  pc.dc.onopen = () => { adopt(p, pc); p.pc == pc && (toPeer(p, {t: 'v', on: !!sentVideo}), greet(p)) }
+  pc.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
+  pc.dc.onclose = () => p.pc == pc && !p.relay && drop(p.id)
+  pc.ontrack = e => pc.ms.addTrack(e.track)
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState == 'connected') adopt(p, pc)
+    if (pc.connectionState != 'failed' || p.pc != pc || peers[p.id] != p) return
+    if (!p.ok) return hard(p) || relay(p) // with a hard NAT the stage timers take it from here
+    // worked before, so the network changed: start over. The lower id offers, so only one side does.
+    drop(p.id)
+    if (me.id < p.id) connect(p.id, true)
+  }
+  return pc
+}
+
+function adopt(p, pc) {
+  if (p.ok) return p.pc == pc || pc.close() // another attempt won
+  p.ok = true
+  ;[p.pc, ...p.bs].forEach(o => o != pc && o.close())
+  p.pc = pc; p.bs = []; p.v.srcObject = pc.ms
+  setTracks(pc); status(p, '')
+}
+
+function av(pc) {
+  pc.addTransceiver('audio', {direction: 'sendrecv'})
+  pc.addTransceiver('video', {direction: 'sendrecv'})
+  setTracks(pc)
+}
+
+function setTracks(pc) {
+  const [a, v] = pc.getTransceivers()
   a.sender.replaceTrack(local.getAudioTracks()[0] || null)
   v.sender.replaceTrack(sentVideo)
 }
@@ -164,12 +190,101 @@ function setTracks(p) {
 // hole punching failed: keep the peer for chat, relayed through the server's signal channel
 function relay(p) {
   if (p.relay || p.ok) return
-  p.relay = true; p.pc.close(); label(p); greet(p)
+  p.relay = true; [p.pc, ...p.bs].forEach(o => o.close()); p.bs = []
+  status(p, 'chat only, via server'); greet(p)
+}
+
+// Hole punching, escalating. Plain ICE fails when one side's NAT picks a new port per destination
+// (common on mobile CGNAT) and the other only lets in replies from addresses it has sent to: neither
+// knows where to send. The side with the easy NAT does the guessing; once it hits the hard side's
+// port, both NATs let the traffic through.
+const srflx = c => { const f = c.candidate?.split(' ') || []; return f[7] == 'srflx' && f[2].toLowerCase() == 'udp' && f[4].includes('.') && f }
+// one IP and network (Chrome's network-id; Firefox has none), several ports
+const sym = l => { const k = f => f[4] + ' ' + f[f.indexOf('network-id') + 1]; return new Set(l.map(f => k(f) + ' ' + f[5])).size > new Set(l.map(k)).size }
+const hard = p => sym(p.ls) != sym(p.rs) // exactly one side is hard; both hard is hopeless without TURN
+const easy = p => hard(p) && !sym(p.ls)
+
+function stages(p) {
+  const at = (ms, f) => setTimeout(() => peers[p.id] == p && !p.ok && !p.relay && f(), ms)
+  at(4000, () => hard(p) && (status(p, 'guessing ports'), easy(p) && guess(p)))
+  at(12000, () => hard(p) && (status(p, 'trying many ports'), easy(p) && burst(p).catch(console.warn)))
+  at(40000, () => hard(p) || relay(p)) // a lost offer/answer never reaches 'failed'
+  at(60000, () => relay(p))
+}
+
+const status = (p, t) => p.i.textContent = t ? t + (p.ok || p.relay ? '' : '…') : ''
+
+// add made-up remote candidates: the peer's NAT IP at ports we hope it will use
+function spray(pc, ip, ports) {
+  ports.forEach((port, k) => port > 0 && port < 65536 &&
+    pc.addIceCandidate({candidate: `candidate:g${k} 1 udp ${1e6 - k} ${ip} ${port} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: '0'}).catch(() => {}))
+}
+
+// Stage 2: NATs that hand out ports in order (often per subscriber) put our mapping just above
+// the ones the STUN servers saw, at the same step.
+// ponytail: only guesses upwards, 256 ports; widen if real NATs land further away
+function guess(p) {
+  const ports = p.rs.map(f => +f[5]).sort((a, b) => a - b), top = ports.at(-1)
+  const step = Math.min(Math.max(ports[1] - ports[0], 1), 32) // smallest gap: other users' traffic only widens gaps
+  spray(p.pc, p.rs.at(-1)[4], Array.from({length: 256}, (_, k) => top + (k + 1) * step))
+}
+
+// Stage 3, birthday punch: the hard side opens K connections, each making a NAT mapping toward each of our
+// H sockets, and each socket probes M random ports on its IP: P(hit) ≈ 1-e^(-H*K*M/range). Half the probes
+// go near the ports the STUN servers saw (CGNATs often give each subscriber a block of ports), half
+// anywhere: ~80% for a fully random NAT, near certain inside a block of a few thousand ports. Each side's
+// attempts share ICE credentials and a DTLS certificate, so any pair that meets can finish the handshake.
+// ponytail: Chrome checks ~16 candidates/s per connection, so M=256 takes ~30s; H is the knob for speed.
+const H = 8, K = 48, M = 256
+
+async function shared() {
+  const cert = await RTCPeerConnection.generateCertificate({name: 'ECDSA', namedCurve: 'P-256'}), u = hex(8), w = hex(16)
+  return {cert, munge: d => ({type: d.type, sdp: d.sdp.replace(/a=ice-ufrag:.*/g, 'a=ice-ufrag:' + u).replace(/a=ice-pwd:.*/g, 'a=ice-pwd:' + w)})}
+}
+
+async function burst(p) { // easy side: offer
+  const {cert, munge} = await shared()
+  p.bs = Array.from({length: H}, () => mkpc(p, cert))
+  for (const pc of p.bs) {
+    av(pc)
+    pc.onicecandidate = e => e.candidate && sig(p.id, {c: e.candidate, b: 1})
+    await pc.setLocalDescription(munge(await pc.createOffer()))
+  }
+  sig(p.id, {sdp: p.bs[0].localDescription, b: 1})
+}
+
+const rnd = (a, b) => a + Math.floor(Math.random() * (b - a))
+
+async function onBurst(p, d) {
+  const ports = p.rs.map(f => +f[5]), lo = Math.min(...ports), hi = Math.max(...ports), w = Math.max(1024, 2 * (hi - lo))
+  const near = () => rnd(Math.max(1024, lo - w), Math.min(65536, hi + w))
+  if (p.ok || p.relay) return
+  if (d.c) return p.bc.push(d.c), p.bs.forEach(pc => pc.addIceCandidate(d.c).catch(() => {}))
+  if (d.sdp.type == 'answer') { // easy side: start probing
+    for (const pc of p.bs) {
+      await pc.setRemoteDescription(d.sdp)
+      spray(pc, p.rs.at(-1)[4], Array.from({length: M}, (_, k) => k % 2 ? near() : rnd(1024, 65536)))
+    }
+    return
+  }
+  // hard side: open K mappings, all answering the same offer
+  status(p, 'trying many ports')
+  const {cert, munge} = await shared()
+  p.bs = Array.from({length: K}, () => mkpc(p, cert))
+  for (const pc of p.bs) {
+    await pc.setRemoteDescription(d.sdp)
+    pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
+    setTracks(pc)
+    await pc.setLocalDescription(munge(await pc.createAnswer()))
+    p.bc.forEach(c => pc.addIceCandidate(c).catch(() => {}))
+  }
+  sig(p.id, {sdp: p.bs[0].localDescription, b: 1})
 }
 
 function onSignal(from, d) {
   let p = peers[from]
   if (d.m) return p && onData(p, d.m) // relayed chat
+  if (d.b) return p && (p.chain = p.chain.then(() => onBurst(p, d)).catch(console.warn))
   if (d.sdp?.type == 'offer' && p) { drop(from); p = null } // they're reconnecting after a network change
   if (!p) { if (d.sdp?.type != 'offer') return; p = connect(from, false) }
   p.chain = p.chain.then(async () => {
@@ -177,34 +292,23 @@ function onSignal(from, d) {
       await p.pc.setRemoteDescription(d.sdp)
       if (d.sdp.type == 'offer') {
         p.pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
-        setTracks(p)
+        setTracks(p.pc)
         await p.pc.setLocalDescription()
         sig(from, {sdp: p.pc.localDescription})
       }
     } else if (d.c) {
       await p.pc.addIceCandidate(d.c)
-      predict(p.pc, d.c)
+      const f = srflx(d.c)
+      if (f) { p.rs.push(f); spray(p.pc, f[4], [1, 2, 3, 4, 5, 6, 7, 8].map(k => +f[5] + k)) } // stage 1: cheap guess
     }
   }).catch(console.warn)
-}
-
-// ponytail: port prediction for NATs that hand out ports sequentially (some CGNATs).
-// Useless against random-port NATs; those need TURN.
-function predict(pc, c) {
-  const f = c.candidate.split(' ')
-  if (f[7] != 'srflx' || f[2].toLowerCase() != 'udp') return
-  for (let k = 1; k <= 8; k++) {
-    const port = +f[5] + k
-    if (port > 65535) break
-    pc.addIceCandidate({candidate: `candidate:p${k} 1 udp ${+f[3] - k} ${f[4]} ${port} typ srflx raddr 0.0.0.0 rport 0`, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex}).catch(() => {})
-  }
 }
 
 function drop(id) {
   const p = peers[id]
   if (!p) return
   delete peers[id]
-  p.pc.close(); p.d.remove()
+  ;[p.pc, ...p.bs].forEach(o => o.close()); p.d.remove()
   update()
 }
 
@@ -218,8 +322,8 @@ function onData(p, m) {
   }
 }
 
-const label = p => p.s.textContent = p.name + (p.relay ? ' · chat only' : '')
-const toPeer = (p, m) => p.dc.readyState == 'open' ? p.dc.send(JSON.stringify(m)) : p.relay && sig(p.id, {m})
+const label = p => p.s.textContent = p.name
+const toPeer = (p, m) => p.pc.dc.readyState == 'open' ? p.pc.dc.send(JSON.stringify(m)) : p.relay && sig(p.id, {m})
 const bcast = m => Object.values(peers).forEach(p => toPeer(p, m))
 const greet = p => { toPeer(p, {t: 'name', name: myName()}); chats.forEach(m => toPeer(p, {...m, t: 'hist'})) }
 const myName = () => $('name').value.trim() || 'Guest'

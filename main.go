@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,9 @@ import (
 
 //go:embed index.html
 var page []byte
+
+//go:embed lab.html
+var labPage []byte
 
 type peer struct {
 	id, token, room string
@@ -152,6 +157,38 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// lab takes a NAT measurement from /lab, adds what our STUN servers saw from the same public IPs,
+// logs it as one JSON line (journalctl -u hi | grep lab) and returns the server's view to the page.
+func lab(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	mu.Lock()
+	joins[ip]++
+	slow := joins[ip] > maxJoinsPerMin
+	mu.Unlock()
+	if slow {
+		http.Error(w, "slow down", 429)
+		return
+	}
+	var m struct {
+		IPs []string `json:"ips"`
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil || json.Unmarshal(raw, &m) != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	ips := map[string]bool{ip: true}
+	for _, a := range m.IPs {
+		if net.ParseIP(a) != nil {
+			ips[a] = true
+		}
+	}
+	hits := stunHits(ips, 3*time.Minute)
+	b, _ := json.Marshal(map[string]any{"from": ip, "client": json.RawMessage(raw), "server": hits})
+	log.Printf("lab %s", b)
+	json.NewEncoder(w).Encode(hits)
+}
+
 // signal relays an opaque blob (SDP, ICE, or chat for peers that couldn't hole punch)
 // to another peer in the sender's room. Nothing is stored.
 func signal(w http.ResponseWriter, r *http.Request) {
@@ -182,12 +219,19 @@ func signal(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
-	stun := flag.String("stun", ":3478", "STUN UDP listen address")
+	stun := flag.String("stun", ":3478", "STUN UDP listen address; the next 3 ports too, so clients can measure NATs that pick a new port per destination")
 	cert := flag.String("cert", "", "TLS cert file (browsers need HTTPS for camera/mic except on localhost)")
 	key := flag.String("key", "", "TLS key file")
 	flag.Parse()
 
-	go func() { log.Print("STUN stopped, calls across NATs won't connect: ", stunServe(*stun)) }()
+	host, port, err := net.SplitHostPort(*stun)
+	p, _ := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65532 {
+		log.Fatal("bad -stun address: ", *stun)
+	}
+	for k := range 4 {
+		go func() { log.Print("STUN stopped, calls across NATs won't connect: ", stunServe(net.JoinHostPort(host, strconv.Itoa(p+k)))) }()
+	}
 	go func() {
 		for range time.Tick(time.Minute) {
 			mu.Lock()
@@ -196,19 +240,22 @@ func main() {
 		}
 	}()
 
-	stunPort := (*stun)[strings.LastIndex(*stun, ":")+1:]
-	html := bytes.ReplaceAll(page, []byte("{{STUN_PORT}}"), []byte(stunPort))
-	serve := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(html)
+	serve := func(page []byte) http.HandlerFunc {
+		html := bytes.ReplaceAll(page, []byte("{{STUN_PORT}}"), []byte(port))
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(html)
+		}
 	}
 
-	http.HandleFunc("GET /{$}", serve)
-	http.HandleFunc("GET /{code}", serve)
+	http.HandleFunc("GET /{$}", serve(page))
+	http.HandleFunc("GET /{code}", serve(page))
+	http.HandleFunc("GET /lab", serve(labPage))
+	http.HandleFunc("POST /api/lab", lab)
 	http.HandleFunc("GET /api/{code}/events", events)
 	http.HandleFunc("POST /api/signal", signal)
 
-	log.Printf("http %s, stun udp %s", *addr, *stun)
+	log.Printf("http %s, stun udp %s to port %d", *addr, *stun, p+3)
 	srv := &http.Server{Addr: *addr, ReadHeaderTimeout: 10 * time.Second} // no WriteTimeout: SSE streams are long-lived
 	if *cert != "" {
 		log.Fatal(srv.ListenAndServeTLS(*cert, *key))

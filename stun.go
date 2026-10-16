@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/binary"
 	"net"
+	"sync"
+	"time"
 )
 
 const stunCookie = 0x2112A442
@@ -14,6 +16,7 @@ func stunServe(addr string) error {
 	if err != nil {
 		return err
 	}
+	dst := c.LocalAddr().(*net.UDPAddr).Port
 	buf := make([]byte, 1500)
 	for {
 		n, from, err := c.ReadFrom(buf)
@@ -22,8 +25,45 @@ func stunServe(addr string) error {
 		}
 		if resp := stunReply(buf[:n], from.(*net.UDPAddr)); resp != nil {
 			c.WriteTo(resp, from)
+			stunRecord(from.(*net.UDPAddr), dst)
 		}
 	}
+}
+
+// Recent Binding requests, so /lab can show the order in which a NAT handed out ports.
+type stunHit struct {
+	T    int64  `json:"t"` // unix ms
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+	Dst  int    `json:"dst"`
+}
+
+var (
+	stunMu  sync.Mutex
+	stunLog []stunHit // ponytail: in-memory, trimmed by half at 50k; 3 MB worst case
+)
+
+func stunRecord(from *net.UDPAddr, dst int) {
+	stunMu.Lock()
+	defer stunMu.Unlock()
+	if len(stunLog) >= 50000 {
+		stunLog = append(stunLog[:0], stunLog[25000:]...)
+	}
+	stunLog = append(stunLog, stunHit{time.Now().UnixMilli(), from.IP.String(), from.Port, dst})
+}
+
+// stunHits returns the requests from ips in the last window.
+func stunHits(ips map[string]bool, window time.Duration) []stunHit {
+	since := time.Now().Add(-window).UnixMilli()
+	stunMu.Lock()
+	defer stunMu.Unlock()
+	out := []stunHit{}
+	for _, h := range stunLog {
+		if h.T >= since && ips[h.IP] {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // stunReply returns a Binding success response carrying XOR-MAPPED-ADDRESS,

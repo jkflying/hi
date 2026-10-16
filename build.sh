@@ -27,5 +27,5 @@ if ! cmp -s hi /usr/local/bin/hi || ! cmp -s hi.service /etc/systemd/system/hi.s
   systemctl enable -q hi
   systemctl restart hi
 fi
-command -v ufw >/dev/null && ufw allow 3478/udp comment "hi STUN" >/dev/null
+command -v ufw >/dev/null && ufw allow 3478:3481/udp comment "hi STUN" >/dev/null
 systemctl is-active -q hi && echo "hi is running"

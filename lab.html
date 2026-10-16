@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NAT lab</title>
+<link rel="icon" href="data:,">
+<style>
+:root{--bg:#111;--fg:#eee;--panel:#222;--accent:#3b82f6;color-scheme:dark}
+body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+main{max-width:720px;margin:auto;padding:16px}
+h1{font-weight:500}
+button{font:inherit;color:inherit;background:var(--accent);border:0;border-radius:8px;padding:10px 14px;cursor:pointer}
+button:disabled{opacity:.5}
+pre{background:var(--panel);padding:12px;border-radius:8px;overflow:auto;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}
+p{color:#aaa}
+</style>
+</head>
+<body>
+<main>
+<h1>NAT lab</h1>
+<p>Measures how your network's NAT hands out ports, so calls can be punched through it. Takes about 45 seconds.
+Run it once on mobile data and once on Wi-Fi. It also contacts Google's and Cloudflare's STUN servers, and the
+results (your public IP and ports, browser and connection type) are sent to this server's log.</p>
+<button id="run">Run</button>
+<pre id="out">Not run yet.</pre>
+</main>
+<script>
+const $ = id => document.getElementById(id)
+const P = +'{{STUN_PORT}}', H = location.hostname
+const ours = [0, 1, 2, 3].map(k => `stun:${H}:${P + k}`)
+const ext = ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478']
+const say = t => $('out').textContent = t
+let T0
+
+// One socket per network (max-bundle); resolves with its candidates once gathering ends.
+function gather(urls, ms = 5000) {
+  return new Promise(res => {
+    const pc = new RTCPeerConnection({iceServers: [{urls}], bundlePolicy: 'max-bundle'}), out = [], t = Math.round(performance.now() - T0)
+    const done = () => { pc.close(); res({t, c: out}) }
+    pc.createDataChannel('x')
+    pc.onicecandidate = e => {
+      if (!e.candidate) return done()
+      const f = e.candidate.candidate.split(' ')
+      out.push({url: e.candidate.url || e.url || null, type: f[7], proto: f[2].toLowerCase(), ip: f[4], port: +f[5], t: Math.round(performance.now() - T0)})
+    }
+    pc.createOffer().then(o => pc.setLocalDescription(o))
+    setTimeout(done, ms)
+  })
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+const srflx = s => s.c.filter(c => c.type == 'srflx' && c.proto == 'udp')
+
+$('run').onclick = async () => {
+  $('run').disabled = true
+  T0 = performance.now()
+  const r = {ua: navigator.userAgent, net: navigator.connection && {type: navigator.connection.type, eff: navigator.connection.effectiveType}, start: Date.now()}
+  try {
+    say('1/3 One socket, seven STUN servers…')
+    r.dest = await gather([...ours, ...ext])
+
+    say('2/3 A new socket every 250 ms for 25 s…')
+    const tl = []
+    for (let i = 0; i < 100; i++) { tl.push(gather(ours.slice(0, 2))); await sleep(250) }
+    r.timeline = await Promise.all(tl)
+
+    say('3/3 32 sockets at once…')
+    r.burst = await Promise.all(Array.from({length: 32}, () => gather([ours[0]])))
+  } catch (e) { r.error = String(e) }
+
+  r.ips = [...new Set([r.dest, ...(r.timeline || []), ...(r.burst || [])].filter(Boolean).flatMap(s => srflx(s).map(c => c.ip)))]
+  let server = []
+  try { server = await (await fetch('/api/lab', {method: 'POST', body: JSON.stringify(r)})).json() } catch (e) { r.uploadError = String(e) }
+  say(summary(r, server))
+  $('run').disabled = false
+}
+
+function summary(r, server) {
+  const L = []
+  L.push(`Browser: ${r.ua}`, `Connection: ${JSON.stringify(r.net) || 'unknown'}`, '')
+  L.push('One socket toward each STUN server (public address seen):')
+  for (const c of srflx(r.dest || {c: []})) L.push(`  ${c.url || '?'}  ->  ${c.ip}:${c.port}`)
+  const v6 = (r.dest?.c || []).some(c => c.ip.includes(':') && c.type == 'srflx')
+  L.push(`IPv6 reachable: ${v6 ? 'yes' : 'no'}`)
+  const ports = new Set(srflx(r.dest || {c: []}).filter(c => c.ip.includes('.')).map(c => c.port))
+  L.push(`IPv4 mapping: ${ports.size <= 1 ? 'same port for every destination (easy NAT)' : ports.size + ' different ports for 7 destinations (hard NAT)'}`, '')
+
+  // the server's view, in arrival order, without retransmits
+  const seen = new Set(), seq = server.filter(h => h.ip.includes('.') && !seen.has(h.port) && seen.add(h.port))
+  if (seq.length > 1) {
+    const d = seq.slice(1).map((h, i) => h.port - seq[i].port), sorted = [...d].sort((a, b) => a - b)
+    const small = d.filter(x => x > 0 && x <= 8).length
+    L.push(`Server saw ${seq.length} distinct ports from you, in order:`, '  ' + seq.slice(0, 80).map(h => h.port).join(' ') + (seq.length > 80 ? ' …' : ''))
+    L.push(`Range: ${Math.min(...seq.map(h => h.port))}–${Math.max(...seq.map(h => h.port))}`)
+    L.push(`Step between consecutive ports: median ${sorted[sorted.length >> 1]}, ${Math.round(100 * small / d.length)}% are +1..+8`)
+    L.push(small / d.length > .6 ? 'Looks sequential: ports can be predicted.' : 'Looks random: only the birthday burst can help.')
+  } else L.push('Server saw no ports (blocked UDP?)')
+  L.push('', r.uploadError ? 'Upload failed: ' + r.uploadError : 'Uploaded to the server log. Thanks!')
+  return L.join('\n')
+}
+</script>
+</body>
+</html>
