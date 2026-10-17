@@ -252,8 +252,9 @@ function live(p, pc) {
 // knows where to send. The side with the easy NAT does the guessing; once it hits the hard side's
 // port, both NATs let the traffic through.
 const srflx = c => { const f = c.candidate?.split(' ') || []; return f[7] == 'srflx' && f[2].toLowerCase() == 'udp' && f[4].includes('.') && f }
-// one IP and network (Chrome's network-id; Firefox has none), several ports
-const sym = l => { const k = f => f[4] + ' ' + f[f.indexOf('network-id') + 1]; return new Set(l.map(f => k(f) + ' ' + f[5])).size > new Set(l.map(k)).size }
+// one local socket (raddr rport), several public ports. Per socket, because a computer with two network
+// interfaces behind one easy NAT shows two ports too. If the browser hides raddr, all its sockets count as one.
+const sym = l => { const k = f => f[4] + ' ' + f[9] + ' ' + f[11]; return new Set(l.map(f => k(f) + ' ' + f[5])).size > new Set(l.map(k)).size }
 const hard = p => sym(p.ls) != sym(p.rs) // exactly one side is hard; both hard is hopeless without TURN
 const easy = p => hard(p) && !sym(p.ls)
 
@@ -279,17 +280,19 @@ function stages(p) {
 async function report(p) {
   const n = {}, add = (k, v = 1) => n[k] = (n[k] || 0) + v, ours = new Set(), prflx = new Set()
   const pcs = [p.pc, ...p.bs].filter(pc => pc.signalingState != 'closed')
-  for (const pc of pcs) {
+  // in parallel, each with a timeout: Firefox's getStats can hang forever on a connection closed meanwhile
+  const stats = await Promise.all(pcs.map(pc => Promise.race([pc.getStats().catch(() => new Map()), new Promise(r => setTimeout(r, 2000, new Map()))])))
+  for (const [i, pc] of pcs.entries()) {
     add('conn_' + pc.connectionState)
-    for (const s of (await pc.getStats().catch(() => new Map())).values()) {
+    for (const s of stats[i].values()) {
       if (s.type == 'candidate-pair') add('pair_' + s.state), add('sent', s.requestsSent || 0), add('answered', s.responsesReceived || 0), add('got', s.requestsReceived || 0)
       if (s.type == 'local-candidate' && s.candidateType == 'srflx') ours.add(s.port)
       if (s.type == 'remote-candidate' && s.candidateType == 'prflx') prflx.add((s.address || s.ipAddress) + ':' + s.port)
     }
   }
   const d = {t: Math.round((Date.now() - p.t0) / 1000), peer: p.id, ua: navigator.userAgent, net: navigator.connection?.type, role: easy(p) ? 'easy' : hard(p) ? 'hard' : sym(p.ls) ? 'both hard' : 'neither hard',
-    ok: p.ok, live: p.live, relay: p.relay, round: p.round, pcs: pcs.length, n, prflx: [...prflx].slice(0, 50),
-    mine: p.ls.map(f => f[4] + ':' + f[5]), theirs: p.rs.map(f => f[4] + ':' + f[5]), srflxPorts: [...ours].sort((a, b) => a - b).slice(0, 300)}
+    ok: p.ok, live: p.live, relay: p.relay, tr: p.tr?.connectionState, round: p.round, pcs: pcs.length, n, prflx: [...prflx].slice(0, 50),
+    mine: p.ls.map(f => f[4] + ':' + f[5] + '<' + f[9] + ':' + f[11]), theirs: p.rs.map(f => f[4] + ':' + f[5] + '<' + f[9] + ':' + f[11]), srflxPorts: [...ours].sort((a, b) => a - b).slice(0, 300)}
   fetch('/api/diag', {method: 'POST', body: JSON.stringify({token: me.token, d})}).catch(() => {})
 }
 

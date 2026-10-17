@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/pion/logging"
 	"github.com/pion/turn/v4"
 )
 
@@ -31,8 +33,9 @@ const (
 
 var (
 	turnSecret = make([]byte, 32)
-	turnPort   string
+	turnURL    string
 	everyone   = &bucket{rate: totalRate, burst: totalRate / 4}
+	dropped    atomic.Int64 // bytes the rate caps threw away, logged every 10s
 )
 
 func turnServe(addr, ip string) error {
@@ -50,10 +53,13 @@ func turnServe(addr, ip string) error {
 	if err != nil {
 		return err
 	}
-	_, turnPort, _ = net.SplitHostPort(addr)
+	_, port, _ := net.SplitHostPort(addr)
+	// an IP, not our hostname: that has an AAAA record too, and browsers that try it over IPv6 get no answer
+	turnURL = "turn:" + net.JoinHostPort(relayIP.String(), port) + "?transport=udp"
 	_, err = turn.NewServer(turn.ServerConfig{
-		Realm:       "hi",
-		AuthHandler: func(user, realm string, _ net.Addr) ([]byte, bool) { return turnKey(user, realm) },
+		Realm:         "hi",
+		LoggerFactory: turnLogs{},
+		AuthHandler:   func(user, realm string, _ net.Addr) ([]byte, bool) { return turnKey(user, realm) },
 		PacketConnConfigs: []turn.PacketConnConfig{{
 			PacketConn:            conn,
 			RelayAddressGenerator: &limitedRelay{turn.RelayAddressGeneratorPortRange{RelayAddress: relayIP, Address: "0.0.0.0", MinPort: relayMin, MaxPort: relayMax}},
@@ -62,8 +68,33 @@ func turnServe(addr, ip string) error {
 	})
 	if err == nil {
 		log.Printf("turn udp %s, relays %s:%d-%d", addr, relayIP, relayMin, relayMax)
+		go func() {
+			for range time.Tick(10 * time.Second) {
+				if n := dropped.Swap(0); n > 0 {
+					log.Printf("turn: rate caps dropped %d bytes in 10s", n)
+				}
+			}
+		}()
 	}
 	return err
+}
+
+// pion logs refused requests (bad credentials, no permission) and new relays at debug level, next to a
+// line per relayed packet; pass only those two on, plus its info and up.
+type turnLogs struct{}
+
+func (turnLogs) NewLogger(scope string) logging.LeveledLogger {
+	f := logging.NewDefaultLoggerFactory()
+	f.DefaultLogLevel = logging.LogLevelInfo
+	return turnLog{f.NewLogger(scope)}
+}
+
+type turnLog struct{ logging.LeveledLogger }
+
+func (l turnLog) Debugf(format string, a ...any) {
+	if strings.HasPrefix(format, "Failed to handle datagram") || strings.HasPrefix(format, "Listening on relay") {
+		l.Infof(format, a...)
+	}
 }
 
 // turnKey accepts a username we issued (expiry:room:id) while it's unexpired and its owner is still in a call.
@@ -91,7 +122,7 @@ func inCall(room, id string) bool {
 // turnCreds hands a room member credentials for the relay.
 func turnCreds(w http.ResponseWriter, r *http.Request) {
 	var m struct{ Token string }
-	if turnPort == "" || json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&m) != nil {
+	if turnURL == "" || json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&m) != nil {
 		http.Error(w, "no relay", 404)
 		return
 	}
@@ -103,11 +134,7 @@ func turnCreds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := fmt.Sprintf("%d:%s:%s", time.Now().Add(credTTL).Unix(), p.room, p.id)
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
-	}
-	json.NewEncoder(w).Encode(map[string]any{"urls": "turn:" + host + ":" + turnPort + "?transport=udp", "username": user, "credential": turnPass(user)})
+	json.NewEncoder(w).Encode(map[string]any{"urls": turnURL, "username": user, "credential": turnPass(user)})
 }
 
 type limitedRelay struct {
@@ -131,6 +158,7 @@ type limited struct {
 
 func (c limited) WriteTo(p []byte, a net.Addr) (int, error) {
 	if !c.b.take(len(p)) || !everyone.take(len(p)) {
+		dropped.Add(int64(len(p)))
 		return len(p), nil
 	}
 	return c.PacketConn.WriteTo(p, a)
