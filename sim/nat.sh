@@ -19,7 +19,7 @@ link natH lan 192.168.2.1/24 home eth 192.168.2.2/24; nx home ip route add defau
 for n in natP natH; do nx $n sysctl -qw net.ipv4.ip_forward=1; done
 
 # latency: each NAT's link to the internet, both directions
-delay() { local j=$(( $3 / 5 )); for d in "$1 $2" "inet i$2"; do nx ${d% *} tc qdisc add dev ${d#* } root netem delay ${3}ms ${j}ms; done; }
+delay() { local j=$(( $3 / 5 )); [ -n "${SEED:-}" ] && j=0; for d in "$1 $2" "inet i$2"; do nx ${d% *} tc qdisc add dev ${d#* } root netem delay ${3}ms ${j}ms; done; }
 delay natP e1 ${PHONE_MS:-30}; delay natH e2 ${HOME_MS:-10}
 
 case $mode in random) flag=random span=64512;; block) flag="to :20000-21023 random" span=1024;; preserve) flag="" span=64512;;
@@ -73,6 +73,7 @@ fi
 bin() { [ "$1" = firefox ] && ls /ms-playwright/firefox-*/firefox/firefox || ls /ms-playwright/chromium-*/chrome-linux/chrome; }
 printf '#!/bin/sh\n[ -d %s/phone ] && echo $$ > %s/phone/cgroup.procs\nexec nsenter --net=/run/netns/phone %s "$@"\n' $cg $cg $(bin ${PHONE_BR:-chromium}) > /tmp/br-phone
 printf '#!/bin/sh\nexec nsenter --net=/run/netns/home %s "$@"\n' $(bin ${HOME_BR:-chromium}) > /tmp/br-home; chmod +x /tmp/br-*
+rm -f /out/moz-*
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=10.0.0.1 -keyout /tmp/k.pem -out /tmp/c.pem -days 1 2>/dev/null
 nx srv /hi -addr 10.0.0.1:8080 -stun 10.0.0.1:3478 -cert /tmp/c.pem -key /tmp/k.pem -turn-ip 10.0.0.1 > /out/hi.log 2>&1 &
 nx natP tcpdump -Z root -U -nni e1 udp -w /tmp/natP.pcap 2>/dev/null &
@@ -83,3 +84,4 @@ NODE_PATH=/pw/node_modules BR_A=${HOME_BR:-chromium} BR_B=${PHONE_BR:-chromium} 
 sleep 1; pkill -x tcpdump || true; sleep 1
 echo "--- public side of the phone's NAT: its mappings toward home, home's probes toward it"
 tcpdump -tt -nnr /tmp/natP.pcap 2>/dev/null > /out/all.txt; python3 /sim/pairs.py /out/all.txt $span
+[ -n "$TRACE" ] && cp /tmp/natP.pcap /out/nat.pcap # for STUN attributes (stun.py)

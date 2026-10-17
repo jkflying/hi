@@ -25,6 +25,7 @@ var labPage []byte
 
 type peer struct {
 	id, token, room string
+	joined          time.Time // first stream open, kept across reconnects: the relay is only for a call's start
 	ch              chan []byte
 	done            chan struct{} // closed when a reconnect replaces this stream
 }
@@ -34,8 +35,10 @@ var (
 	rooms  = map[string]map[string]*peer{}
 	tokens = map[string]*peer{}
 	joins  = map[string]int{} // per-IP stream opens this minute; stops room-code scanning
+	creds  = map[string]int{} // per-IP relay credentials this minute; one machine can't take all relay ports
 
 	maxJoinsPerMin = 30
+	maxCredsPerMin = 10 // a bridge per peer, plus rebuilds; carrier NAT users share an IP, so not too tight
 
 	codeRe  = regexp.MustCompile(`^\d{6,12}$`)
 	idRe    = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -80,8 +83,9 @@ func events(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id or token taken", 409)
 		return
 	}
+	p.joined = time.Now()
 	if old != nil { // reconnect: take over the queue so nothing pending is lost, retire the stale stream
-		p.ch = old.ch
+		p.ch, p.joined = old.ch, old.joined
 		close(old.done)
 	}
 	ids := []string{}
@@ -267,6 +271,7 @@ func main() {
 		for range time.Tick(time.Minute) {
 			mu.Lock()
 			clear(joins)
+			clear(creds)
 			mu.Unlock()
 		}
 	}()

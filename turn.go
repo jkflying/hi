@@ -20,15 +20,17 @@ import (
 	"github.com/pion/turn/v4"
 )
 
-// TURN relay: a bridge while hole punching keeps searching, and the fallback when it never succeeds.
+// TURN relay: a bridge for the first couple of minutes while hole punching searches, so one server can serve many
+// callers: calls that never go direct drop to chat only (the page's BRIDGE, a bit less than bridgeMax).
 // Abuse limits: credentials are only handed to members of a room with someone else in it, and stop
 // working when the member leaves; relays may only talk to each other (both sides relay, so nobody can
 // bounce traffic to third parties); every relay port and the whole server are rate capped.
 const (
-	relayMin, relayMax = 50000, 50199   // 2 ports per call
-	allocRate          = 1_000_000 / 8  // bytes/s each relay port may send: video is capped at 300 kbit/s
-	totalRate          = 20_000_000 / 8 // bytes/s for all relays together
-	credTTL            = 12 * time.Hour
+	relayMin, relayMax = 50000, 50199      // 2 ports per call
+	allocRate          = 1_000_000 / 8     // bytes/s each relay port may send: video is capped at 300 kbit/s
+	totalRate          = 20_000_000 / 8    // bytes/s for all relays together
+	bridgeMax          = 150 * time.Second // each relay port is closed this long after it's allocated
+	credTTL            = bridgeMax         // and its credentials can't allocate another or refresh it
 )
 
 var (
@@ -119,6 +121,19 @@ func inCall(room, id string) bool {
 	return rooms[room][id] != nil && len(rooms[room]) > 1
 }
 
+// bridging: someone in p's room (p, or whoever p is connecting to) joined less than bridgeMax ago. The relay only
+// carries the start of a call, so one server serves many callers; leaving and rejoining for more hits the IP caps.
+func bridging(p *peer) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, o := range rooms[p.room] {
+		if time.Since(o.joined) < bridgeMax {
+			return true
+		}
+	}
+	return false
+}
+
 // turnCreds hands a room member credentials for the relay.
 func turnCreds(w http.ResponseWriter, r *http.Request) {
 	var m struct{ Token string }
@@ -126,11 +141,22 @@ func turnCreds(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no relay", 404)
 		return
 	}
+	ip := clientIP(r)
 	mu.Lock()
 	p := tokens[m.Token]
+	creds[ip]++
+	slow := creds[ip] > maxCredsPerMin
 	mu.Unlock()
 	if p == nil || !inCall(p.room, p.id) {
 		http.Error(w, "not in a call", 403)
+		return
+	}
+	if slow {
+		http.Error(w, "slow down", 429)
+		return
+	}
+	if !bridging(p) {
+		http.Error(w, "relay is only for a call's start", 403)
 		return
 	}
 	user := fmt.Sprintf("%d:%s:%s", time.Now().Add(credTTL).Unix(), p.room, p.id)
@@ -146,6 +172,7 @@ func (g *limitedRelay) AllocatePacketConn(network string, port int) (net.PacketC
 	if err != nil {
 		return nil, nil, err
 	}
+	time.AfterFunc(bridgeMax, func() { c.Close() })
 	return limited{c, &bucket{rate: allocRate, burst: allocRate / 2}}, a, nil
 }
 

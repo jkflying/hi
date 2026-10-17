@@ -11,11 +11,14 @@
 #   DBG=1                print all of both pages' console output
 #   RELOAD=N             once both are direct, reload the phone and connect again, N times
 #   DROP=1               ...instead of reloading, the phone quietly closes its direct connection
+#   SEED=n               repeatable page randomness and no delay jitter (see two.js); timing still varies
+#   TRACE=1              log every connection's events (sim/timeline.py); TRACE=2 adds Firefox's own logs, out/moz-*
 # Results in sim/out: run.txt (per-second view from both pages), hi.log (server, with ?diag reports), all.txt (packets).
+# With TRACE set, also nat.pcap (for stun.py).
 set -euo pipefail
 cd "$(dirname "$0")"
 (cd .. && CGO_ENABLED=0 GOTOOLCHAIN=local go build -o hi .) # index.html is embedded, so rebuild for every run
 podman build -q -t hisim . >/dev/null # cached unless the Containerfile changed
 mkdir -p out
-podman run --rm --privileged -e HOME_BR -e PHONE_BR -e PHONE_MS -e HOME_MS -e PHONE_CPU -e PHONE_LAG -e RELOAD -e DROP -e HOME_NAT -e DBG \
+podman run --rm --privileged -e HOME_BR -e PHONE_BR -e PHONE_MS -e HOME_MS -e PHONE_CPU -e PHONE_LAG -e RELOAD -e DROP -e HOME_NAT -e DBG -e SEED -e TRACE -e LOSE_ACK \
   -v "$PWD:/sim:ro" -v "$PWD/out:/out" -v "$PWD/../hi:/hi:ro" hisim bash /sim/nat.sh "${1:-random}" "${2:-90}" | tee out/run.txt
