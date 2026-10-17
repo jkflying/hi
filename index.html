@@ -390,7 +390,7 @@ async function onBurst(p, d) {
     if (p.round != b || p.ok) return clearInterval(roll)
     if (busy) return
     busy = true
-    p.bs = p.bs.filter(pc => Date.now() - pc.born < 12000 || pc.close())
+    p.bs = p.bs.filter(pc => Date.now() - pc.born < 12000 || /conn|compl/.test(pc.iceConnectionState) || pc.close()) // not one mid-handshake
     await open(16).catch(console.warn)
     busy = false
   }, 1000)
