@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 # Plain HTTP on localhost: put a TLS-terminating proxy in front (browsers need HTTPS for camera/mic).
-# STUN on UDP 3478-3481 must be reachable from the internet.
+# STUN on UDP 3478-3481, TURN on UDP 3482 and its relays on UDP 50000-50199 must be reachable from the internet.
 ExecStart=/usr/local/bin/hi -addr 127.0.0.1:8090 -stun :3478
 Restart=always
 DynamicUser=yes

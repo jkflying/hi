@@ -222,6 +222,8 @@ func main() {
 	stun := flag.String("stun", ":3478", "STUN UDP listen address; the next 3 ports too, so clients can measure NATs that pick a new port per destination")
 	cert := flag.String("cert", "", "TLS cert file (browsers need HTTPS for camera/mic except on localhost)")
 	key := flag.String("key", "", "TLS key file")
+	turnAddr := flag.String("turn", ":3482", "TURN UDP listen address (empty disables the relay); relay ports 50000-50199 must be reachable too")
+	turnIP := flag.String("turn-ip", "", "public IP of the relay ports (default: the address we reach the internet from)")
 	flag.Parse()
 
 	host, port, err := net.SplitHostPort(*stun)
@@ -230,7 +232,14 @@ func main() {
 		log.Fatal("bad -stun address: ", *stun)
 	}
 	for k := range 4 {
-		go func() { log.Print("STUN stopped, calls across NATs won't connect: ", stunServe(net.JoinHostPort(host, strconv.Itoa(p+k)))) }()
+		go func() {
+			log.Print("STUN stopped, calls across NATs won't connect: ", stunServe(net.JoinHostPort(host, strconv.Itoa(p+k))))
+		}()
+	}
+	if *turnAddr != "" {
+		if err := turnServe(*turnAddr, *turnIP); err != nil {
+			log.Print("TURN disabled, calls that can't hole punch get chat only: ", err)
+		}
 	}
 	go func() {
 		for range time.Tick(time.Minute) {
@@ -254,6 +263,7 @@ func main() {
 	http.HandleFunc("POST /api/lab", lab)
 	http.HandleFunc("GET /api/{code}/events", events)
 	http.HandleFunc("POST /api/signal", signal)
+	http.HandleFunc("POST /api/turn", turnCreds)
 
 	log.Printf("http %s, stun udp %s to port %d", *addr, *stun, p+3)
 	srv := &http.Server{Addr: *addr, ReadHeaderTimeout: 10 * time.Second} // no WriteTimeout: SSE streams are long-lived

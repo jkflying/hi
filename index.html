@@ -148,17 +148,26 @@ function connect(id, offer) {
 }
 
 // One connection attempt to peer p. Several can race (see burst); the first to connect is adopted.
-function mkpc(p, cert) {
-  const pc = new RTCPeerConnection({...CFG, certificates: cert && [cert]})
+// The TURN bridge (extra.iceTransportPolicy) carries the call until a direct attempt connects.
+function mkpc(p, extra) {
+  const pc = new RTCPeerConnection({...CFG, ...extra})
+  const won = () => pc.turn ? live(p, pc) : adopt(p, pc)
+  pc.turn = !!extra?.iceTransportPolicy
   pc.ms = new MediaStream()
   pc.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
-  pc.dc.onopen = () => { adopt(p, pc); p.pc == pc && (toPeer(p, {t: 'v', on: !!sentVideo}), greet(p)) }
+  pc.dc.onopen = () => { won(); (p.pc == pc || p.tr == pc && !p.ok) && (toPeer(p, {t: 'v', on: !!sentVideo}), greet(p)) }
   pc.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
   pc.dc.onclose = () => p.pc == pc && p.ok && !p.relay && drop(p.id) // Firefox closes it when ICE fails, before any connection
   pc.ontrack = e => pc.ms.addTrack(e.track)
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState == 'connected') adopt(p, pc)
-    if (pc.connectionState != 'failed' || p.pc != pc || peers[p.id] != p) return
+    if (pc.connectionState == 'connected') won()
+    if (pc.connectionState != 'failed' || peers[p.id] != p) return
+    if (p.tr == pc) { // the bridge broke (server restart, network blip): rebuild it, chat via signaling meanwhile
+      p.tr = p.live = null; status(p, 'reconnecting')
+      setTimeout(() => { offerBridge(p); setTimeout(() => relay(p), 10000) }, 1000)
+      return
+    }
+    if (p.pc != pc) return
     if (!p.ok) return hard(p) || relay(p) // with a hard NAT the stage timers take it from here
     // worked before, so the network changed: start over. The lower id offers, so only one side does.
     drop(p.id)
@@ -170,8 +179,8 @@ function mkpc(p, cert) {
 function adopt(p, pc) {
   if (p.ok) return p.pc == pc || pc.close() // another attempt won
   p.ok = true
-  ;[p.pc, ...p.bs].forEach(o => o != pc && o.close())
-  p.pc = pc; p.bs = []; p.v.srcObject = pc.ms
+  ;[p.pc, ...p.bs, p.tr].forEach(o => o && o != pc && o.close())
+  p.pc = pc; p.bs = []; p.tr = p.live = p.relay = null; p.v.srcObject = pc.ms
   setTracks(pc); status(p, '')
 }
 
@@ -187,11 +196,51 @@ function setTracks(pc) {
   v.sender.replaceTrack(sentVideo)
 }
 
-// hole punching failed: keep the peer for chat, relayed through the server's signal channel
+// no direct path and no TURN bridge: keep the peer for chat, relayed through the server's signal channel
 function relay(p) {
-  if (p.relay || p.ok) return
-  p.relay = true; [p.pc, ...p.bs].forEach(o => o.close()); p.bs = []
-  status(p, 'chat only, via server'); greet(p)
+  if (p.relay || p.ok || p.live) return
+  p.relay = true; p.pc.close()
+  status(p); greet(p)
+}
+
+// TURN bridge, offered by the lower id once a plain connection hasn't happened within a few seconds.
+// Relay-only on both sides, video capped, so the server carries little; hole punching keeps going behind it.
+async function bridge(p) {
+  if (p.tr || p.ok || peers[p.id] != p) return p.tr
+  const r = await fetch('/api/turn', {method: 'POST', body: JSON.stringify({token: me.token})}).catch(() => null)
+  if (!r?.ok || p.tr || p.ok || peers[p.id] != p) return p.tr
+  const pc = p.tr = mkpc(p, {iceServers: [await r.json()], iceTransportPolicy: 'relay'})
+  pc.onicecandidate = e => e.candidate && sig(p.id, {c: e.candidate, r: 1})
+  return pc
+}
+
+const offerBridge = p => me.id < p.id && (p.chain = p.chain.then(async () => {
+  const pc = await bridge(p)
+  if (!pc || p.ok) return
+  av(pc)
+  await pc.setLocalDescription()
+  sig(p.id, {sdp: pc.localDescription, r: 1})
+}).catch(console.warn))
+
+async function onTurn(p, d) {
+  if (d.sdp?.type == 'offer' && p.tr?.remoteDescription) p.tr.close(), p.tr = p.live = null // they lost the old one first
+  const pc = d.sdp?.type == 'offer' ? await bridge(p) : p.tr
+  if (!pc || p.ok) return
+  if (d.c) return pc.addIceCandidate(d.c)
+  await pc.setRemoteDescription(d.sdp)
+  if (d.sdp.type != 'offer') return
+  pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
+  setTracks(pc)
+  await pc.setLocalDescription()
+  sig(p.id, {sdp: pc.localDescription, r: 1})
+}
+
+function live(p, pc) {
+  if (p.ok || p.live || p.tr != pc) return
+  p.live = true; p.v.srcObject = pc.ms
+  const s = pc.getTransceivers()[1].sender, q = s.getParameters()
+  if (q.encodings?.[0]) { q.encodings[0].maxBitrate = 3e5; s.setParameters(q).catch(() => {}) }
+  status(p)
 }
 
 // Hole punching, escalating. Plain ICE fails when one side's NAT picks a new port per destination
@@ -204,15 +253,23 @@ const sym = l => { const k = f => f[4] + ' ' + f[f.indexOf('network-id') + 1]; r
 const hard = p => sym(p.ls) != sym(p.rs) // exactly one side is hard; both hard is hopeless without TURN
 const easy = p => hard(p) && !sym(p.ls)
 
+// Runs until a direct connection is found or the peer leaves; the TURN bridge or chat covers the wait.
 function stages(p) {
-  const at = (ms, f) => setTimeout(() => peers[p.id] == p && !p.ok && !p.relay && f(), ms)
-  at(4000, () => hard(p) && (status(p, 'guessing ports'), easy(p) && guess(p)))
-  at(12000, () => hard(p) && (status(p, 'trying many ports'), easy(p) && burst(p).catch(console.warn)))
+  const at = (ms, f) => setTimeout(() => peers[p.id] == p && !p.ok && f(), ms)
+  at(4000, () => {
+    offerBridge(p)
+    hard(p) && (status(p, 'guessing ports'), easy(p) && guess(p))
+  })
+  at(6000, function round() { // a fresh birthday round each time the last one has sent all its probes
+    if (!hard(p)) return
+    status(p, 'trying many ports'); easy(p) && burst(p).catch(console.warn)
+    at(M * GAP + 6000, round)
+  })
   at(40000, () => hard(p) || relay(p)) // a lost offer/answer never reaches 'failed'
   at(60000, () => relay(p))
 }
 
-const status = (p, t) => p.i.textContent = t ? t + (p.ok || p.relay ? '' : '…') : ''
+const status = (p, t) => p.i.textContent = p.ok ? '' : p.live ? 'via server' : p.relay ? 'chat only, via server' : t + '…'
 
 // add made-up remote candidates: the peer's NAT IP at ports we hope it will use. Trickled at about
 // Chrome's check rate: Firefox checks a batch fast, declares ICE failed and stops, but new candidates restart it.
@@ -236,27 +293,30 @@ function guess(p) {
 // anywhere. Each side's attempts share ICE credentials and a DTLS certificate, so any pair that meets can finish the handshake.
 // Measured on Salt 5G: the K mappings toward one of our sockets come out as a near-contiguous run on a
 // per-destination counter that sits anywhere in 1024-65535, so each probe hits with P ≈ K/64512 and the
-// STUN-seen ports say nothing about where. Hits ≈ our probes * K/64512, probes filling the 12s-60s window.
-// Chrome checks ~16/s per connection: ~12 expected hits. Firefox caps STUN at ~78/s per page, which also
-// limits how many of the H*K mappings it makes as the hard side: ~4 hits with one Firefox, ~1.5 with
-// two. The H*K mappings cost the hard side's carrier NAT; it took ~1000 fine.
-// ponytail: K stays modest because each connection costs the phone memory.
-const H = 16, K = 64, GAP = 60, M = 800
+// STUN-seen ports say nothing about where. Hits ≈ our probes * K/64512 per ~54s round; rounds repeat until one hits.
+// So hits grow with live mappings and our probe rate, nothing else. Chrome checks ~16/s per connection; Firefox
+// caps STUN at ~78/s per page, so a Firefox easy side uses one fast-probing connection. A Chrome hard side keeps
+// K connections all round; a Firefox one keeps a rolling pool (see onBurst). Only one socket per connection can
+// carry the call (the data channel's), so mappings mean connections. They cost the hard side's carrier NAT;
+// Salt took ~1000 fine. Simulated, every browser pair connects directly in ~7-30s.
+// ponytail: K=256 connections on the hard side, a phone; lower it if phones choke.
+const FF = /Firefox/.test(navigator.userAgent), K = 256, H = FF ? 1 : 4, GAP = FF ? 13 : 60, M = Math.round(48000 / GAP)
 
 async function shared() {
   const cert = await RTCPeerConnection.generateCertificate({name: 'ECDSA', namedCurve: 'P-256'}), u = hex(8), w = hex(16)
   return {cert, munge: d => ({type: d.type, sdp: d.sdp.replace(/a=ice-ufrag:.*/g, 'a=ice-ufrag:' + u).replace(/a=ice-pwd:.*/g, 'a=ice-pwd:' + w)})}
 }
 
-async function burst(p) { // easy side: offer
-  const {cert, munge} = await shared()
-  p.bs = Array.from({length: H}, () => mkpc(p, cert))
+async function burst(p) { // easy side: offer. Each round has a number, so stale replies are ignored.
+  const {cert, munge} = await shared(), b = p.round = (p.round || 0) + 1
+  p.bs.forEach(o => o.close())
+  p.bs = Array.from({length: H}, () => mkpc(p, {certificates: [cert]}))
   for (const pc of p.bs) {
     av(pc)
-    pc.onicecandidate = e => e.candidate && sig(p.id, {c: e.candidate, b: 1})
+    pc.onicecandidate = e => e.candidate && sig(p.id, {c: e.candidate, b})
     await pc.setLocalDescription(munge(await pc.createOffer()))
   }
-  sig(p.id, {sdp: p.bs[0].localDescription, b: 1})
+  sig(p.id, {sdp: p.bs[0].localDescription, b})
 }
 
 const rnd = (a, b) => a + Math.floor(Math.random() * (b - a))
@@ -264,7 +324,11 @@ const rnd = (a, b) => a + Math.floor(Math.random() * (b - a))
 async function onBurst(p, d) {
   const ports = p.rs.map(f => +f[5]), lo = Math.min(...ports), hi = Math.max(...ports), w = Math.max(1024, 2 * (hi - lo))
   const near = () => rnd(Math.max(1024, lo - w), Math.min(65536, hi + w))
-  if (p.ok || p.relay) return
+  if (p.ok) return
+  if (d.b != p.round) {
+    if (easy(p)) return // a reply to an earlier round
+    p.round = d.b; clearInterval(p.again); p.bs.forEach(o => o.close()); p.bs = []; p.bc = [] // the easy side started a new round
+  }
   if (d.c) return p.bc.push(d.c), p.bs.forEach(pc => pc.addIceCandidate(d.c).catch(() => {}))
   if (d.sdp.type == 'answer') { // easy side: start probing
     for (const pc of p.bs) {
@@ -273,28 +337,42 @@ async function onBurst(p, d) {
     }
     return
   }
-  // hard side: open K mappings, all answering the same offer
+  // hard side: open K mappings, all answering the same offer with the same credentials
   status(p, 'trying many ports')
-  const {cert, munge} = await shared()
-  p.bs = Array.from({length: K}, () => mkpc(p, cert))
-  for (const pc of p.bs) {
-    await pc.setRemoteDescription(d.sdp)
-    pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
-    setTracks(pc)
-    await pc.setLocalDescription(munge(await pc.createAnswer()))
-    p.bc.forEach(c => pc.addIceCandidate(c).catch(() => {}))
+  const {cert, munge} = await shared(), b = d.b
+  const open = async n => {
+    for (let i = 0; i < n && p.round == b && !p.ok; i++) {
+      const pc = mkpc(p, {certificates: [cert]})
+      pc.born = Date.now(); p.bs.push(pc)
+      await pc.setRemoteDescription(d.sdp)
+      pc.getTransceivers().forEach(t => t.direction = 'sendrecv')
+      setTracks(pc)
+      await pc.setLocalDescription(munge(await pc.createAnswer()))
+      p.bc.forEach(c => pc.addIceCandidate(c).catch(() => {}))
+    }
   }
-  sig(p.id, {sdp: p.bs[0].localDescription, b: 1})
-  // Firefox checks each pair once or twice, then gives up: re-add the candidates under new names so it
-  // keeps the mappings toward us alive and still answers when a probe finally lands. Not more often: under
-  // Firefox's STUN rate cap (~63/s per page) one round of K*H checks takes ~16s.
-  const again = setInterval(() => p.ok || p.relay || !p.bs.length ? clearInterval(again) : p.bs.forEach(pc =>
-    p.bc.forEach(c => pc.addIceCandidate({...c, candidate: c.candidate.replace(/^candidate:\S+/, 'candidate:r' + hex(4))}).catch(() => {}))), 20000)
+  await open(FF ? 16 : K)
+  sig(p.id, {sdp: p.bs[0].localDescription, b})
+  // Firefox gives up on a connection's checks after ~10s and then only answers probes, without the check back
+  // that ICE needs, and re-adding the same candidates doesn't restart it. So keep a rolling pool: 16 new
+  // connections a second, each closed after 12s. Its STUN rate cap (~78/s per page, each check sent ~5 times)
+  // allows ~15 new mappings a second anyway, so ~150-190 are always fresh.
+  if (!FF) return
+  let busy
+  const roll = p.again = setInterval(async () => {
+    if (p.round != b || p.ok) return clearInterval(roll)
+    if (busy) return
+    busy = true
+    p.bs = p.bs.filter(pc => Date.now() - pc.born < 12000 || pc.close())
+    await open(16).catch(console.warn)
+    busy = false
+  }, 1000)
 }
 
 function onSignal(from, d) {
   let p = peers[from]
   if (d.m) return p && onData(p, d.m) // relayed chat
+  if (d.r) return p && (p.chain = p.chain.then(() => onTurn(p, d)).catch(console.warn))
   if (d.b) return p && (p.chain = p.chain.then(() => onBurst(p, d)).catch(console.warn))
   if (d.sdp?.type == 'offer' && p) { drop(from); p = null } // they're reconnecting after a network change
   if (!p) { if (d.sdp?.type != 'offer') return; p = connect(from, false) }
@@ -319,7 +397,7 @@ function drop(id) {
   const p = peers[id]
   if (!p) return
   delete peers[id]
-  ;[p.pc, ...p.bs].forEach(o => o.close()); p.d.remove()
+  ;[p.pc, ...p.bs, p.tr].forEach(o => o?.close()); p.d.remove()
   update()
 }
 
@@ -334,7 +412,7 @@ function onData(p, m) {
 }
 
 const label = p => p.s.textContent = p.name
-const toPeer = (p, m) => p.pc.dc.readyState == 'open' ? p.pc.dc.send(JSON.stringify(m)) : p.relay && sig(p.id, {m})
+const toPeer = (p, m) => { const dc = [p.pc.dc, p.tr?.dc].find(c => c?.readyState == 'open'); dc ? dc.send(JSON.stringify(m)) : p.relay && sig(p.id, {m}) }
 const bcast = m => Object.values(peers).forEach(p => toPeer(p, m))
 const greet = p => { toPeer(p, {t: 'name', name: myName()}); chats.forEach(m => toPeer(p, {...m, t: 'hist'})) }
 const myName = () => $('name').value.trim() || 'Guest'
@@ -353,7 +431,7 @@ function update() {
   const want = camOn && (!big || talking) ? local.getVideoTracks()[0] : null
   if (want == sentVideo) return
   sentVideo = want
-  Object.values(peers).forEach(p => p.relay || p.pc.getTransceivers()[1]?.sender.replaceTrack(want))
+  Object.values(peers).forEach(p => [p.pc, p.tr].forEach(pc => pc?.getTransceivers()[1]?.sender.replaceTrack(want).catch(() => {})))
   bcast({t: 'v', on: !!want})
 }
 
