@@ -81,6 +81,9 @@ try { $('name').value = localStorage.name || '' } catch {}
 const fromUrl = location.pathname.slice(1)
 if (/^\d{6,12}$/.test(fromUrl)) { $('code').value = fromUrl; $('code').hidden = $('new').hidden = true }
 onpopstate = () => location.reload()
+// opening any page with ?diag makes this device report each call's connection attempts to the server log
+// (journalctl -u hi | grep diag) until it opens one with ?diag=0
+const DIAG = (() => { try { const q = new URLSearchParams(location.search).get('diag'); if (q != null) localStorage.diag = q == '0' ? '' : 1; return !!localStorage.diag } catch { return false } })()
 
 // 10 digits so generated rooms can't be found by scanning; typed codes can still be as short as 6
 $('new').onclick = () => { $('code').value = String(10n ** 9n + crypto.getRandomValues(new BigUint64Array(1))[0] % (9n * 10n ** 9n)); $('lobby').requestSubmit() }
@@ -182,6 +185,7 @@ function adopt(p, pc) {
   ;[p.pc, ...p.bs, p.tr].forEach(o => o && o != pc && o.close())
   p.pc = pc; p.bs = []; p.tr = p.live = p.relay = null; p.v.srcObject = pc.ms
   setTracks(pc); status(p, '')
+  DIAG && report(p)
 }
 
 function av(pc) {
@@ -267,6 +271,26 @@ function stages(p) {
   })
   at(40000, () => hard(p) || relay(p)) // a lost offer/answer never reaches 'failed'
   at(60000, () => relay(p))
+  p.t0 = Date.now(); const tick = () => peers[p.id] == p && !p.ok && (report(p), setTimeout(tick, 10000))
+  DIAG && setTimeout(tick, 5000)
+}
+
+// ?diag: every 10s until direct, what this side's attempts did. prflx = an address whose checks got in to us (a hit).
+async function report(p) {
+  const n = {}, add = (k, v = 1) => n[k] = (n[k] || 0) + v, ours = new Set(), prflx = new Set()
+  const pcs = [p.pc, ...p.bs].filter(pc => pc.signalingState != 'closed')
+  for (const pc of pcs) {
+    add('conn_' + pc.connectionState)
+    for (const s of (await pc.getStats().catch(() => new Map())).values()) {
+      if (s.type == 'candidate-pair') add('pair_' + s.state), add('sent', s.requestsSent || 0), add('answered', s.responsesReceived || 0), add('got', s.requestsReceived || 0)
+      if (s.type == 'local-candidate' && s.candidateType == 'srflx') ours.add(s.port)
+      if (s.type == 'remote-candidate' && s.candidateType == 'prflx') prflx.add((s.address || s.ipAddress) + ':' + s.port)
+    }
+  }
+  const d = {t: Math.round((Date.now() - p.t0) / 1000), peer: p.id, ua: navigator.userAgent, net: navigator.connection?.type, role: easy(p) ? 'easy' : hard(p) ? 'hard' : sym(p.ls) ? 'both hard' : 'neither hard',
+    ok: p.ok, live: p.live, relay: p.relay, round: p.round, pcs: pcs.length, n, prflx: [...prflx].slice(0, 50),
+    mine: p.ls.map(f => f[4] + ':' + f[5]), theirs: p.rs.map(f => f[4] + ':' + f[5]), srflxPorts: [...ours].sort((a, b) => a - b).slice(0, 300)}
+  fetch('/api/diag', {method: 'POST', body: JSON.stringify({token: me.token, d})}).catch(() => {})
 }
 
 const status = (p, t) => p.i.textContent = p.ok ? '' : p.live ? 'via server' : p.relay ? 'chat only, via server' : t + '…'

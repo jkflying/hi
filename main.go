@@ -189,6 +189,28 @@ func lab(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(hits)
 }
 
+// diag logs a call report from a client opened with ?diag (journalctl -u hi | grep diag).
+// ponytail: any room member can write to the log, 32KB a time; rate limit per token if anyone abuses it
+func diag(w http.ResponseWriter, r *http.Request) {
+	var m struct {
+		Token string
+		D     json.RawMessage
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&m) != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	mu.Lock()
+	p := tokens[m.Token]
+	mu.Unlock()
+	if p == nil {
+		http.Error(w, "unknown token", 403)
+		return
+	}
+	log.Printf("diag %s %s %s %s", p.room, p.id, clientIP(r), m.D)
+	w.WriteHeader(204)
+}
+
 // signal relays an opaque blob (SDP, ICE, or chat for peers that couldn't hole punch)
 // to another peer in the sender's room. Nothing is stored.
 func signal(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +286,7 @@ func main() {
 	http.HandleFunc("GET /api/{code}/events", events)
 	http.HandleFunc("POST /api/signal", signal)
 	http.HandleFunc("POST /api/turn", turnCreds)
+	http.HandleFunc("POST /api/diag", diag)
 
 	log.Printf("http %s, stun udp %s to port %d", *addr, *stun, p+3)
 	srv := &http.Server{Addr: *addr, ReadHeaderTimeout: 10 * time.Second} // no WriteTimeout: SSE streams are long-lived
