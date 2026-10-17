@@ -1,0 +1,3 @@
+FROM mcr.microsoft.com/playwright:v1.48.2-noble
+RUN apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq iproute2 nftables tcpdump >/dev/null
+RUN mkdir /pw && cd /pw && npm i -s playwright-core@1.48.2

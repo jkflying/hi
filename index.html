@@ -158,12 +158,13 @@ function mkpc(p, extra) {
   pc.turn = !!extra?.iceTransportPolicy
   pc.ms = new MediaStream()
   pc.dc = pc.createDataChannel('c', {negotiated: true, id: 0})
+  // trusted once the data channel opens, not when our handshake finishes: that takes a round trip with the
+  // other side, so it has a working connection too
   pc.dc.onopen = () => { won(); (p.pc == pc || p.tr == pc && !p.ok) && (toPeer(p, {t: 'v', on: !!sentVideo}), greet(p)) }
   pc.dc.onmessage = e => { try { onData(p, JSON.parse(e.data)) } catch {} }
-  pc.dc.onclose = () => p.pc == pc && p.ok && !p.relay && drop(p.id) // Firefox closes it when ICE fails, before any connection
+  pc.dc.onclose = () => p.pc == pc && p.ok && peers[p.id] == p && lost(p) // Firefox closes it when ICE fails, before 'failed'
   pc.ontrack = e => pc.ms.addTrack(e.track)
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState == 'connected') won()
     if (pc.connectionState != 'failed' || peers[p.id] != p) return
     if (p.tr == pc) { // the bridge broke (server restart, network blip): rebuild it, chat via signaling meanwhile
       p.tr = p.live = null; status(p, 'reconnecting')
@@ -172,11 +173,16 @@ function mkpc(p, extra) {
     }
     if (p.pc != pc) return
     if (!p.ok) return hard(p) || relay(p) // with a hard NAT the stage timers take it from here
-    // worked before, so the network changed: start over. The lower id offers, so only one side does.
-    drop(p.id)
-    if (me.id < p.id) connect(p.id, true)
+    lost(p)
   }
   return pc
+}
+
+// a direct connection died, because the network changed or the other side lost it: start over. The lower id
+// offers, so only one side does; the other tells it, as it may not have noticed.
+function lost(p) {
+  drop(p.id)
+  me.id < p.id ? connect(p.id, true) : sig(p.id, {again: 1})
 }
 
 function adopt(p, pc) {
@@ -341,6 +347,8 @@ async function burst(p) { // easy side: offer. Each round has a number, so stale
   for (const pc of p.bs) {
     av(pc)
     pc.onicecandidate = e => e.candidate && sig(p.id, {c: e.candidate, b})
+    // a probe got an answer: Firefox now cancels all our other checks, so this one has to finish (see onBurst)
+    pc.oniceconnectionstatechange = () => pc.iceConnectionState == 'connected' && sig(p.id, {hold: 1, b})
     await pc.setLocalDescription(munge(await pc.createOffer()))
   }
   sig(p.id, {sdp: p.bs[0].localDescription, b})
@@ -356,6 +364,7 @@ async function onBurst(p, d) {
     if (easy(p)) return // a reply to an earlier round
     p.round = d.b; clearInterval(p.again); p.bs.forEach(o => o.close()); p.bs = []; p.bc = [] // the easy side started a new round
   }
+  if (d.hold) return p.hold = Date.now() + 10000 // one of ours answered: keep it open, and leave it the STUN budget
   if (d.c) return p.bc.push(d.c), p.bs.forEach(pc => pc.addIceCandidate(d.c).catch(() => {}))
   if (d.sdp.type == 'answer') { // easy side: start probing
     for (const pc of p.bs) {
@@ -388,7 +397,7 @@ async function onBurst(p, d) {
   let busy
   const roll = p.again = setInterval(async () => {
     if (p.round != b || p.ok) return clearInterval(roll)
-    if (busy) return
+    if (busy || Date.now() < p.hold) return
     busy = true
     p.bs = p.bs.filter(pc => Date.now() - pc.born < 12000 || /conn|compl/.test(pc.iceConnectionState) || pc.close()) // not one mid-handshake
     await open(16).catch(console.warn)
@@ -399,6 +408,7 @@ async function onBurst(p, d) {
 function onSignal(from, d) {
   let p = peers[from]
   if (d.m) return p && onData(p, d.m) // relayed chat
+  if (d.again) return (!p || Date.now() - p.t0 > 5000) && (p && drop(from), connect(from, true)) // unless we just did
   if (d.r) return p && (p.chain = p.chain.then(() => onTurn(p, d)).catch(console.warn))
   if (d.b) return p && (p.chain = p.chain.then(() => onBurst(p, d)).catch(console.warn))
   if (d.sdp?.type == 'offer' && p) { drop(from); p = null } // they're reconnecting after a network change
