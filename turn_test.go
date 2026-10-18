@@ -59,3 +59,19 @@ func TestTurnCreds(t *testing.T) {
 		t.Errorf("past the per-IP cap: %d", c)
 	}
 }
+
+func TestLeave(t *testing.T) {
+	p := &peer{id: "a", token: "ta", room: "1", done: make(chan struct{})}
+	rooms["1"], tokens["ta"] = map[string]*peer{"a": p}, p
+	for range 2 { // a second beacon (or a stale token) is a no-op, not a double close
+		leave(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/leave", strings.NewReader("ta")))
+	}
+	select {
+	case <-p.done:
+	default:
+		t.Error("the stream should be told to end")
+	}
+	if rooms["1"] != nil || tokens["ta"] != nil {
+		t.Error("left peer still listed")
+	}
+}

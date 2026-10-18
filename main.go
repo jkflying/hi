@@ -215,6 +215,23 @@ func diag(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+// leave is the page's beacon on unload: a reload after switching networks leaves the old stream on a dead link,
+// which the server would only notice minutes later, so the others would keep trying to reach a ghost.
+func leave(w http.ResponseWriter, r *http.Request) {
+	tok, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 64))
+	mu.Lock()
+	if p := tokens[string(tok)]; p != nil {
+		delete(rooms[p.room], p.id) // so a reconnect can't close done again; events announces the leave
+		delete(tokens, p.token)
+		if len(rooms[p.room]) == 0 {
+			delete(rooms, p.room)
+		}
+		close(p.done)
+	}
+	mu.Unlock()
+	w.WriteHeader(204)
+}
+
 // signal relays an opaque blob (SDP, ICE, or chat for peers that couldn't hole punch)
 // to another peer in the sender's room. Nothing is stored.
 func signal(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +307,7 @@ func main() {
 	http.HandleFunc("POST /api/lab", lab)
 	http.HandleFunc("GET /api/{code}/events", events)
 	http.HandleFunc("POST /api/signal", signal)
+	http.HandleFunc("POST /api/leave", leave)
 	http.HandleFunc("POST /api/turn", turnCreds)
 	http.HandleFunc("POST /api/diag", diag)
 

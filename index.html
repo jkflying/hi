@@ -111,6 +111,7 @@ $('lobby').onsubmit = async e => {
     if (m.t == 'signal') onSignal(m.from, m.data)
     if (m.t == 'leave' && peers[m.id] && !peers[m.id].ok) drop(m.id) // P2P peers detect leaving themselves
   }
+  addEventListener('pagehide', () => navigator.sendBeacon('/api/leave', me.token))
   es.onerror = () => es.readyState == EventSource.CLOSED && toast('Lost the server, reload to let new people join', 1e9)
   watchVoice()
 }
@@ -313,7 +314,12 @@ async function report(p) {
       if (s.type == 'remote-candidate' && s.candidateType == 'prflx') prflx.add((s.address || s.ipAddress) + ':' + s.port)
     }
   }
-  const d = {t: Math.round((Date.now() - p.t0) / 1000), peer: p.id, ua: navigator.userAgent, net: navigator.connection?.type, role: easy(p) ? 'easy' : hard(p) ? 'hard' : sym(p.ls) ? 'both hard' : 'neither hard',
+  // the bridge's video each way: is a slow picture the relay, the sender backing off, or this side not keeping up decoding
+  const media = {}
+  for (const s of (p.tr && await Promise.race([p.tr.getStats().catch(() => null), new Promise(r => setTimeout(r, 2000))]))?.values() || [])
+    if (s.kind == 'video' && /^(in|out)bound-rtp$/.test(s.type)) media[s.type[0]] = {kB: (s.bytesReceived ?? s.bytesSent) >> 10, fps: s.framesPerSecond,
+      frames: s.framesDecoded ?? s.framesEncoded, dropped: s.framesDropped, lost: s.packetsLost, nack: s.nackCount, pli: s.pliCount, w: s.frameWidth, h: s.frameHeight}
+  const d = {t: Math.round((Date.now() - p.t0) / 1000), peer: p.id, media, ua: navigator.userAgent, net: navigator.connection?.type, role: easy(p) ? 'easy' : hard(p) ? 'hard' : sym(p.ls) ? 'both hard' : 'neither hard',
     ok: p.ok, live: p.live, relay: p.relay, tr: p.tr?.connectionState, round: p.round, pcs: pcs.length, n, prflx: [...prflx].slice(0, 50),
     mine: p.ls.map(f => f[4] + ':' + f[5] + '<' + f[9] + ':' + f[11]), theirs: p.rs.map(f => f[4] + ':' + f[5] + '<' + f[9] + ':' + f[11]), srflxPorts: [...ours].sort((a, b) => a - b).slice(0, 300)}
   fetch('/api/diag', {method: 'POST', body: JSON.stringify({token: me.token, d})}).catch(() => {})
@@ -358,9 +364,10 @@ function guess(p) {
 // carry the call (the data channel's), so mappings mean connections. They cost the hard side's carrier NAT;
 // Salt took ~1000 fine. Simulated, every browser pair connects directly in ~7-30s.
 // ponytail: K=256 connections on the hard side, a phone; lower it if phones choke.
-// ponytail: LIFE 25s on Android assumes an old connection there still checks back when hit; ?diag on a real
-// phone (hits that don't finish) tells. Back to 12s if not.
-const LIFE = /Android/.test(navigator.userAgent) ? 25000 : 12000
+// Android too gives up after ~10s (?diag on a real phone: of ~350 pool connections at 25s, ~200 'failed'), and nICEr
+// then answers every probe with an error (ice_component.cpp), so older ones only cost the phone: they share one
+// network thread with the bridge's video, which got choppy.
+const LIFE = 12000
 // ponytail: new pool connections a second on a Firefox hard side. The search time scales with 1/POOL (sim: 48 takes
 // the median search 10s -> 5.6s, the slowest 26s -> 13s), but live carrier mappings are POOL * LIFE: 48 on Android
 // would be ~1200, past the ~1000 Salt took. Raise it after a ?diag test on a real phone.
@@ -437,7 +444,7 @@ async function onBurst(p, d) {
   sig(p.id, {sdp: p.bs[0].localDescription, b})
   // Desktop Firefox gives up on a connection's checks after ~10s and then only answers probes, without the check
   // back that ICE needs, and re-adding the same candidates doesn't restart it. So keep a rolling pool: 16 new
-  // connections a second, each closed after 12s (25s on Android, whose connections keep 'connecting'). Its
+  // connections a second, each closed after 12s. Its
   // STUN rate cap (~78/s per page, each check sent ~5 times) allows ~15 new mappings a second anyway, so
   // ~150-190 are always fresh.
   if (!FF) return
